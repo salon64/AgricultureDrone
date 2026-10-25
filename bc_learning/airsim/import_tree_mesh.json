@@ -1,0 +1,26 @@
+{
+  "ImportGroups": [
+    {
+      "FileNames": ["C:/Users/malco/projects/AgricultureDrone/bc_learning/airsim/assets/Tree_LowPoly.obj"],
+      "DestinationPath": "/Game/Orchard",
+      "bReplaceExisting": true,
+      "bSkipReadOnly": true,
+      "FactoryName": "FbxFactory",
+      "ImportSettings": {
+        "bImportMaterials": true,
+        "bImportTextures": false,
+        "bImportAsSkeletal": false,
+        "bAutomatedImportShouldDetectType": false,
+        "MeshTypeToImport": "FBXIT_StaticMesh",
+        "StaticMeshImportData": {
+          "bCombineMeshes": true,
+          "bAutoGenerateCollision": true,
+          "bGenerateLightmapUVs": false,
+          "bConvertScene": true,
+          "bForceFrontXAxis": false,
+          "ImportUniformScale": 1.0
+        }
+      }
+    }
+  ]
+}

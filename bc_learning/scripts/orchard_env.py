@@ -20,7 +20,9 @@ Reward summary (see _compute_reward for exact weights/constants):
 
 """
 
+import glob
 import math
+import os
 import random
 import time
 
@@ -73,7 +75,21 @@ ORCHARD_YAW_MIN_DEG = -180.0
 ORCHARD_YAW_MAX_DEG = 180.0
 ORCHARD_SCALE_MIN = 0.85
 ORCHARD_SCALE_MAX = 1.15
-LAYOUT_MODE = "grid"          # "grid" = two-row orchard; "scatter" = free scatter
+LAYOUT_MODE = "file"          # "file" = real orchard layouts (bc_learning/layouts/*.csv);
+                              # "grid" = two-row orchard; "scatter" = free scatter
+# --- "file" mode: real-world layouts built with make_layout.py ---------------
+LAYOUT_FILES = "*.csv"        # glob, relative to bc_learning/layouts (or absolute)
+LAYOUT_TREES_MIN, LAYOUT_TREES_MAX = 4, 8   # trees used per episode (window of the layout)
+LAYOUT_MIN_TREE_DIST = ORCHARD_MIN_TREE_DIST # thin the window to this trunk spacing (orbit reward needs it)
+LAYOUT_ROTATE_DEG = (-180.0, 180.0)         # random heading of the window relative to the drone
+LAYOUT_SCALE_JITTER = 0.10                  # +/- per-tree scale jitter on top of the file's scale
+# --- tree actors: spawned at runtime from a static-mesh asset ---------------
+# Any actor whose name matches Tree.* is used (hand-placed ones included). If fewer than
+# TREE_POOL_SIZE exist, the env spawns the rest from TREE_ASSET_NAME (see
+# bc_learning/airsim/import_tree_mesh.bat for how the asset gets into the Blocks project).
+TREE_ASSET_NAME = "Tree_LowPoly"
+TREE_POOL_SIZE = 8            # 0 = never spawn, only use actors already in the level
+TREE_SINK_M = 0.10            # push tree origin this far below the measured ground (trunk extends -0.3 m)
 SCATTER_N_MIN, SCATTER_N_MAX = 3, 6
 SCATTER_X_RANGE = (5.0, 32.0)
 SCATTER_Y_RANGE = (-9.0, 9.0)
@@ -287,6 +303,18 @@ class OrchardEnv(gym.Env):
         self.spawn_xy          = None
         self.tree_positions_xy = []
         self.tree_object_names = []
+        self._pool_ground_z    = None
+        self._layout_files     = []
+        self._layout_name      = None
+        if LAYOUT_MODE == "file":
+            pat = LAYOUT_FILES if os.path.isabs(LAYOUT_FILES) else os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", "layouts", LAYOUT_FILES)
+            self._layout_files = sorted(glob.glob(pat))
+            if not self._layout_files:
+                raise RuntimeError(f"LAYOUT_MODE='file' but no layouts match {pat}. "
+                                   f"Build one with scripts/make_layout.py or set LAYOUT_MODE='grid'.")
+            print(f"[ENV] {len(self._layout_files)} layout file(s): "
+                  f"{[os.path.basename(f) for f in self._layout_files]}")
         self.max_x_bound       = float('inf')
         self.min_x_bound       = float('-inf')
         self.max_y_bound       = float('inf')
@@ -411,6 +439,79 @@ class OrchardEnv(gym.Env):
         n = len(self.tree_positions_xy)
         return n > 0 and all(self._is_tree_done(i) for i in range(n))
 
+    def _tree_actor_names(self):
+        for pattern in ("Tree.*", ".*[Tt]ree.*"):
+            names = self.client.simListSceneObjects(pattern)
+            if names:
+                return names
+        return []
+
+    def _ensure_tree_pool(self):
+        """Spawn Tree_LowPoly actors until TREE_POOL_SIZE actors match Tree.*.
+        Spawned actors survive client.reset(), so this is a no-op after the first episode."""
+        names = self._tree_actor_names()
+        if TREE_POOL_SIZE <= 0 or len(names) >= TREE_POOL_SIZE:
+            return names
+        assets = set(self.client.simListAssets())
+        if TREE_ASSET_NAME not in assets:
+            # simSpawnObject with an unknown asset crashes the UE process, so refuse here.
+            near = sorted(a for a in assets if "tree" in a.lower())[:10]
+            raise RuntimeError(
+                f"Static mesh asset '{TREE_ASSET_NAME}' is not in the AirSim asset registry "
+                f"(tree-like assets: {near}). Import it with "
+                f"bc_learning/airsim/import_tree_mesh.bat and restart the Unreal map.")
+        # The vehicle is sitting on the ground right after reset(): use it as the ground height.
+        if self._pool_ground_z is None:
+            self._pool_ground_z = self.client.simGetVehiclePose().position.z_val + TREE_SINK_M
+        existing = set(names)
+        for i in range(TREE_POOL_SIZE):
+            name = f"TreeP{i:02d}"
+            if name in existing or len(names) >= TREE_POOL_SIZE:
+                continue
+            pose = airsim.Pose(airsim.Vector3r(-200.0 - 5.0 * i, 0.0, self._pool_ground_z),
+                               airsim.to_quaternion(0, 0, 0))
+            spawned = self.client.simSpawnObject(name, TREE_ASSET_NAME, pose,
+                                                 airsim.Vector3r(1.0, 1.0, 1.0), False, False)
+            names.append(spawned)
+        print(f"[ENV] Tree pool: {len(names)} actors ({TREE_ASSET_NAME}) -> {names}")
+        return names
+
+    def _place_layout(self, tree_infos):
+        """'file' mode: put a random window of a real orchard layout in front of the drone."""
+        import orchard_layouts as ol
+        path = random.choice(self._layout_files)
+        trees, meta = ol.read_layout(path)
+        self._layout_name = os.path.basename(path)
+        n_want = random.randint(LAYOUT_TREES_MIN, min(LAYOUT_TREES_MAX, len(tree_infos)))
+        window = ol.pick_window(trees, n_want, rng=random, min_dist_m=LAYOUT_MIN_TREE_DIST)
+        placed = ol.window_to_env_frame(window, ORCHARD_X_START,
+                                        rotate_deg=random.uniform(*LAYOUT_ROTATE_DEG),
+                                        min_dist_from_origin=VIEWPOINT_MAX_DIST + 1.0)
+        parked_x = -200.0
+        active_entries = []
+        for idx, (name, old_x, old_y, old_z) in enumerate(tree_infos):
+            z = old_z if old_x > -100.0 else (self._pool_ground_z if self._pool_ground_z is not None else old_z)
+            if idx < len(placed):
+                x, y, _z_file, yaw_file, scale_file = placed[idx]
+                scale = scale_file * random.uniform(1.0 - LAYOUT_SCALE_JITTER, 1.0 + LAYOUT_SCALE_JITTER)
+                scale = max(ORCHARD_SCALE_MIN, min(ORCHARD_SCALE_MAX, scale))
+                yaw = math.radians(random.uniform(ORCHARD_YAW_MIN_DEG, ORCHARD_YAW_MAX_DEG))
+                pose = airsim.Pose(airsim.Vector3r(x, y, z), airsim.to_quaternion(0, 0, yaw))
+                self.client.simSetObjectPose(name, pose, teleport=True)
+                self.client.simSetObjectScale(name, airsim.Vector3r(scale, scale, scale))
+                active_entries.append((x, y, scale))
+            else:
+                hidden = airsim.Pose(airsim.Vector3r(parked_x - 5.0 * idx, 0.0, z),
+                                     airsim.to_quaternion(0, 0, 0))
+                self.client.simSetObjectPose(name, hidden, teleport=True)
+                self.client.simSetObjectScale(name, airsim.Vector3r(1.0, 1.0, 1.0))
+        active_entries.sort(key=lambda t: t[0])
+        self.tree_scales = [sc for _, _, sc in active_entries]
+        print(f"[ENV] Layout '{self._layout_name}' ({meta.get('crop', '?')}, "
+              f"{len(trees)} trees in file): placed {len(active_entries)} of {n_want} wanted, "
+              f"{len(tree_infos) - len(active_entries)} parked")
+        self._print_tree_positions("inside layout placement")
+
     def _randomize_trees(self):
         names = []
         for pattern in ("Tree.*", ".*[Tt]ree.*"):
@@ -429,6 +530,10 @@ class OrchardEnv(gym.Env):
             tree_infos.append((name, pose.position.x_val, pose.position.y_val, pose.position.z_val))
 
         tree_infos.sort(key=lambda t: (t[1], t[2]))
+
+        if LAYOUT_MODE == "file":
+            self._place_layout(tree_infos)
+            return
 
         if LAYOUT_MODE == "scatter":
             placed = []
@@ -616,6 +721,7 @@ class OrchardEnv(gym.Env):
         self.client.reset()
         time.sleep(0.5 * RESET_SLEEP_SCALE)
         self._printed_marker_debug = False
+        self._ensure_tree_pool()
         self._debug_scene_tree_names()
         self._print_tree_positions("after reset before randomize")
 
@@ -750,7 +856,7 @@ class OrchardEnv(gym.Env):
               f"y_bounds=[{self.min_y_bound:.1f}, {self.max_y_bound:.1f}]")
         if self._step_dt_ema is not None and self._step_dt_ema > 0.0:
             print(
-                f"[ENV] measured step dt ≈ {self._step_dt_ema:.3f} s sim "
+                f"[ENV] measured step dt ~ {self._step_dt_ema:.3f} s sim "
                 f"({1.0 / self._step_dt_ema:.1f} Hz)"
             )
         print(f"[TARGET] Starting with tree {self.target_tree_idx}")

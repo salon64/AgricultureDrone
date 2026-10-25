@@ -1,2 +1,7 @@
-AirSim/
+/AirSim/
 bc_env/
+
+# orchard layout tile cache + python caches
+bc_learning/layouts/.tile_cache/
+__pycache__/
+*.pyc

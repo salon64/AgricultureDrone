@@ -1,0 +1,19 @@
+diff --git a/Unreal/Plugins/AirSim/Source/AirBlueprintLib.cpp b/Unreal/Plugins/AirSim/Source/AirBlueprintLib.cpp
+index cc8dcb31..025d9293 100644
+--- a/Unreal/Plugins/AirSim/Source/AirBlueprintLib.cpp
++++ b/Unreal/Plugins/AirSim/Source/AirBlueprintLib.cpp
+@@ -248,6 +248,14 @@ void UAirBlueprintLib::GenerateAssetRegistryMap(const UObject* context, TMap<FSt
+ 
+         // Find mesh in /Game and /AirSim asset registry. When more plugins are added this function will have to change
+         FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
++        // Outside the editor the registry only knows about assets that are already loaded,
++        // so a mesh that nothing in the level references can never be spawned. Scan the
++        // project content folder synchronously first (cheap: a few hundred ms for Blocks).
++        {
++            TArray<FString> ScanPaths;
++            ScanPaths.Add(TEXT("/Game"));
++            AssetRegistryModule.Get().ScanPathsSynchronous(ScanPaths, true);
++        }
+         AssetRegistryModule.Get().GetAssets(Filter, AssetData);
+ 
+         UObject* LoadObject = NULL;

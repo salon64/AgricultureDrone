@@ -1,0 +1,9 @@
+newmtl canopy
+Kd 0.18 0.42 0.14
+Ka 0 0 0
+Ks 0 0 0
+
+newmtl trunk
+Kd 0.33 0.22 0.12
+Ka 0 0 0
+Ks 0 0 0
